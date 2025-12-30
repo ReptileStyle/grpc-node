@@ -1,9 +1,9 @@
 {
-  "name": "@grpc/grpc-js",
-  "version": "1.9.14",
-  "description": "gRPC Library for Node - pure JS implementation",
-  "homepage": "https://grpc.io/",
-  "repository": "https://github.com/grpc/grpc-node/tree/master/packages/grpc-js",
+  "name": "@reptilestyle/grpc-js",
+  "version": "1.9.14-compression.1",
+  "description": "gRPC Library for Node - pure JS implementation with server compression support",
+  "homepage": "https://github.com/ReptileStyle/grpc-node",
+  "repository": "https://github.com/ReptileStyle/grpc-node/tree/feature/server-compression/packages/grpc-js",
   "main": "build/src/index.js",
   "engines": {
     "node": "^8.13.0 || >=10.10.0"

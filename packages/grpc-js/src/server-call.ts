@@ -40,6 +40,8 @@ import { getErrorCode, getErrorMessage } from './error';
 const TRACER_NAME = 'server_call';
 const unzip = promisify(zlib.unzip);
 const inflate = promisify(zlib.inflate);
+const gzip = promisify(zlib.gzip);
+const deflate = promisify(zlib.deflate);
 
 function trace(text: string): void {
   logging.trace(LogVerbosity.DEBUG, TRACER_NAME, text);
@@ -63,12 +65,7 @@ const deadlineUnitsToMs: DeadlineUnitIndexSignature = {
   u: 0.001,
   n: 0.000001,
 };
-const defaultCompressionHeaders = {
-  // TODO(cjihrig): Remove these encoding headers from the default response
-  // once compression is integrated.
-  [GRPC_ACCEPT_ENCODING_HEADER]: 'identity,deflate,gzip',
-  [GRPC_ENCODING_HEADER]: 'identity',
-};
+// Server compression is now integrated - headers are set dynamically in sendMetadata()
 const defaultResponseHeaders = {
   [http2.constants.HTTP2_HEADER_STATUS]: http2.constants.HTTP_STATUS_OK,
   [http2.constants.HTTP2_HEADER_CONTENT_TYPE]: 'application/grpc+proto',
@@ -227,21 +224,19 @@ export class ServerWritableStreamImpl<RequestType, ResponseType>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     callback: (...args: any[]) => void
   ) {
-    try {
-      const response = this.call.serializeMessage(chunk);
-
+    this.call.serializeMessage(chunk).then((response) => {
       if (!this.call.write(response)) {
         this.call.once('drain', callback);
         return;
       }
-    } catch (err) {
+      callback();
+    }).catch((err) => {
       this.emit('error', {
         details: getErrorMessage(err),
         code: Status.INTERNAL,
       });
-    }
-
-    callback();
+      callback(err);
+    });
   }
 
   _final(callback: Function): void {
@@ -419,6 +414,8 @@ export class Http2ServerCallStream<
   private messagesToPush: Array<RequestType | null> = [];
   private maxSendMessageSize: number = DEFAULT_MAX_SEND_MESSAGE_LENGTH;
   private maxReceiveMessageSize: number = DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH;
+  private serverCompressionAlgorithm: 'identity' | 'gzip' | 'deflate' = 'identity';
+  private clientAcceptedEncodings: string[] = ['identity'];
 
   constructor(
     private stream: http2.ServerHttp2Stream,
@@ -466,6 +463,15 @@ export class Http2ServerCallStream<
     if ('grpc.max_receive_message_length' in options) {
       this.maxReceiveMessageSize = options['grpc.max_receive_message_length']!;
     }
+    // Server compression support
+    if ('grpc.default_compression_algorithm' in options) {
+      const algo = options['grpc.default_compression_algorithm'];
+      if (algo === 2) {
+        this.serverCompressionAlgorithm = 'gzip';
+      } else if (algo === 1) {
+        this.serverCompressionAlgorithm = 'deflate';
+      }
+    }
   }
 
   private checkCancelled(): boolean {
@@ -506,10 +512,14 @@ export class Http2ServerCallStream<
 
     this.metadataSent = true;
     const custom = customMetadata ? customMetadata.toHttp2Headers() : null;
-    // TODO(cjihrig): Include compression headers.
+    // Dynamic compression headers based on server configuration
+    const compressionHeaders = {
+      [GRPC_ACCEPT_ENCODING_HEADER]: 'identity,deflate,gzip',
+      [GRPC_ENCODING_HEADER]: this.serverCompressionAlgorithm,
+    };
     const headers = {
       ...defaultResponseHeaders,
-      ...defaultCompressionHeaders,
+      ...compressionHeaders,
       ...custom,
     };
     this.stream.respond(headers, defaultResponseOptions);
@@ -527,7 +537,11 @@ export class Http2ServerCallStream<
       );
     }
 
-    // TODO(cjihrig): Receive compression metadata.
+    // Extract client's accepted encodings for response compression
+    const acceptEncodings = metadata.get(GRPC_ACCEPT_ENCODING_HEADER);
+    if (acceptEncodings.length > 0 && typeof acceptEncodings[0] === 'string') {
+      this.clientAcceptedEncodings = acceptEncodings[0].split(',').map(s => s.trim());
+    }
 
     const timeoutHeader = metadata.get(GRPC_TIMEOUT_HEADER);
 
@@ -654,15 +668,37 @@ export class Http2ServerCallStream<
     }
   }
 
-  serializeMessage(value: ResponseType) {
+  async serializeMessage(value: ResponseType): Promise<Buffer> {
     const messageBuffer = this.handler.serialize(value);
 
-    // TODO(cjihrig): Call compression aware serializeMessage().
-    const byteLength = messageBuffer.byteLength;
+    // Compression support: check if we should compress
+    const shouldCompress = this.serverCompressionAlgorithm !== 'identity' &&
+      this.clientAcceptedEncodings.includes(this.serverCompressionAlgorithm);
+
+    let finalBuffer: Buffer = messageBuffer;
+    let compressed = false;
+
+    if (shouldCompress) {
+      try {
+        if (this.serverCompressionAlgorithm === 'gzip') {
+          finalBuffer = await gzip(messageBuffer);
+          compressed = true;
+        } else if (this.serverCompressionAlgorithm === 'deflate') {
+          finalBuffer = await deflate(messageBuffer);
+          compressed = true;
+        }
+      } catch (err) {
+        // If compression fails, send uncompressed
+        finalBuffer = messageBuffer;
+        compressed = false;
+      }
+    }
+
+    const byteLength = finalBuffer.byteLength;
     const output = Buffer.allocUnsafe(byteLength + 5);
-    output.writeUInt8(0, 0);
+    output.writeUInt8(compressed ? 1 : 0, 0);
     output.writeUInt32BE(byteLength, 1);
-    messageBuffer.copy(output, 5);
+    finalBuffer.copy(output, 5);
     return output;
   }
 
@@ -693,7 +729,7 @@ export class Http2ServerCallStream<
     }
 
     try {
-      const response = this.serializeMessage(value!);
+      const response = await this.serializeMessage(value!);
 
       this.write(response);
       this.sendStatus({ code: Status.OK, details: 'OK', metadata });
